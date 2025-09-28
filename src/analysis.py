@@ -153,6 +153,15 @@ def calculate_atr(df, period=14):
     df['ATR'] = df['TR'].rolling(window=period).mean()
     return df
 
+def calculate_bollinger_bands(df, window=20, std_dev=2):
+    """Calculates Bollinger Bands and Bandwidth."""
+    df['SMA'] = df['Close'].rolling(window=window).mean()
+    df['StdDev'] = df['Close'].rolling(window=window).std()
+    df['UpperBand'] = df['SMA'] + (df['StdDev'] * std_dev)
+    df['LowerBand'] = df['SMA'] - (df['StdDev'] * std_dev)
+    df['Bandwidth'] = ((df['UpperBand'] - df['LowerBand']) / df['SMA']) * 100
+    return df
+
 
 # --- Trendline Detection Parameters ---
 MIN_TOUCHES = int(os.getenv("MIN_TOUCHES", "3"))
@@ -160,12 +169,14 @@ MAX_DEVIATION_PERCENT = float(os.getenv("MAX_DEVIATION_PERCENT", "0.01")) # 1% d
 MAX_CROSSINGS = int(os.getenv("MAX_CROSSINGS", "2")) # Max allowed close price crosses
 PROMINENCE_PERCENTILE = int(os.getenv("PROMINENCE_PERCENTILE", "75")) # Only consider peaks above this prominence percentile
 ATR_MULTIPLIER = float(os.getenv("ATR_MULTIPLIER", "1.0")) # Multiplier for ATR to calculate price tolerance
+CONSOLIDATION_THRESHOLD = float(os.getenv("CONSOLIDATION_THRESHOLD", "2.0")) # Threshold for Bollinger Bandwidth to detect consolidation
 
 print(f"✅ Trendline MIN_TOUCHES: {MIN_TOUCHES}")
 print(f"✅ Trendline MAX_DEVIATION_PERCENT: {MAX_DEVIATION_PERCENT}")
 print(f"✅ Trendline MAX_CROSSINGS: {MAX_CROSSINGS}")
 print(f"✅ Trendline PROMINENCE_PERCENTILE: {PROMINENCE_PERCENTILE}")
 print(f"✅ Trendline ATR_MULTIPLIER: {ATR_MULTIPLIER}")
+print(f"✅ Consolidation Threshold: {CONSOLIDATION_THRESHOLD}")
 
 def _get_line_equation(p1_x, p1_y, p2_x, p2_y):
     """Calculates the slope and y-intercept of a line given two points."""
@@ -420,9 +431,14 @@ for item in symbols_to_analyze:
 
     df = calculate_atr(df)
 
+    df = calculate_bollinger_bands(df)
+
     if df.empty:
         print(f"DataFrame is empty for {symbol} after processing. Skipping.")
         continue
+
+    # Identify consolidation zones
+    df['Consolidation'] = df['Bandwidth'] < CONSOLIDATION_THRESHOLD
 
     # Apply CHART_CANDLES limit if set for analysis
     chart_candles_str = os.getenv("CHART_CANDLES")
@@ -460,12 +476,41 @@ for item in symbols_to_analyze:
             # The trendline is already calculated on the df_chart, so no need to adjust
             aps.append(mpf.make_addplot(best_resistance_line(x_axis_chart), color='r', linestyle='--'))
 
+        # Draw rectangles for consolidation zones
+        in_consolidation = False
+        zone_start = 0
+        for i in range(len(df_chart)):
+            if df_chart['Consolidation'].iloc[i] and not in_consolidation:
+                in_consolidation = True
+                zone_start = i
+            elif not df_chart['Consolidation'].iloc[i] and in_consolidation:
+                in_consolidation = False
+                zone_end = i - 1
+                zone_high = df_chart['High'].iloc[zone_start:zone_end+1].max()
+                zone_low = df_chart['Low'].iloc[zone_start:zone_end+1].min()
+                df_chart.loc[df_chart.index[zone_start:zone_end+1], 'consolidation_high'] = zone_high
+                df_chart.loc[df_chart.index[zone_start:zone_end+1], 'consolidation_low'] = zone_low
+
         price_min, price_max = df_chart['Low'].min(), df_chart['High'].max()
         y_buffer = (price_max - price_min) * 0.1
         ylim = (price_min - y_buffer, price_max + y_buffer)
 
-        mpf.plot(df_chart, type='candle', style='yahoo', title=f'{symbol} {INTERVAL}-Min Chart', ylabel='Price (INR)',
-                 addplot=aps, savefig=chart_filename, ylim=ylim, figsize=(12, 8), tight_layout=True)
+        plot_kwargs = {
+            'type': 'candle',
+            'style': 'yahoo',
+            'title': f'{symbol} {INTERVAL}-Min Chart',
+            'ylabel': 'Price (INR)',
+            'addplot': aps,
+            'savefig': chart_filename,
+            'ylim': ylim,
+            'figsize': (12, 8),
+            'tight_layout': True
+        }
+
+        if 'consolidation_high' in df_chart and 'consolidation_low' in df_chart:
+            plot_kwargs['fill_between'] = dict(y1=df_chart['consolidation_high'].values, y2=df_chart['consolidation_low'].values, color='#f2f2f2', alpha=0.5)
+
+        mpf.plot(df_chart, **plot_kwargs)
         print(f"Chart saved to {chart_filename}")
     else:
         print(f"No valid trendlines found for {symbol}, skipping chart generation.")
