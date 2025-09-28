@@ -1,0 +1,40 @@
+{
+  "api": {
+    "client_id": "VAC70PGA10-100",
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOlsiZDoxIiwiZDoyIiwieDowIiwieDoxIl0sImF0X2hhc2giOiJnQUFBQUFCb29xMDV3NVp4c0kxVEM5d2plendBU0dDNFQ3LUtvTUhheEJFdTlhXzVmekFwMmpSSHF0TkZkYXJIM09hdUl5S0pjX2gwT1FHa0ZnRG1ubVhJZkt6aWJOMWtldWxLenFVNVdxVFpRWlUteWt6dzQ0az0iLCJkaXNwbGF5X25hbWUiOiIiLCJvbXMiOiJLMSIsImhzbV9rZXkiOiJmNTU5ZTI2MjQ2NDc2M2Y5MWQxMDMzYzYwOTAxYTcyNjUwMzg5NGZjMmU2OTYzMTY5NjYzZTc4NyIsImlzRGRwaUVuYWJsZWQiOiJOIiwiaXNNdGZFbmFibGVkIjoiTiIsImZ5X2lkIjoiWEEzNjAwOSIsImFwcFR5cGUiOjEwMCwiZXhwIjoxNzU1NTYzNDAwLCJpYXQiOjE3NTU0OTE2NDEsImlzcyI6ImFwaS5meWVycy5pbiIsIm5iZiI6MTc1NTQ5MTY0MSwic3ViIjoiYWNjZXNzX3Rva2VuIn0.65zA3CPnHvNpbmKyGg1eyxeTNqQ5kYHk1EGyLT8Gwg8",
+    "log_path": "./logs"
+  },
+  "telegram": {
+    "bot_token": "8073975228:AAFA2n9Fszn16zWCtNUghW7E4Qk1xNgQm-U",
+    "chat_id": "657566600",
+    "enabled": true
+  },
+  "analysis": {
+    "interval": 30,
+    "days_back": 25,
+    "lookback": 3,
+    "lookahead": 3,
+    "min_points": 3,
+    "max_crossings": 3,
+    "min_touches": 4,
+    "min_r_squared": 0.9,
+    "price_threshold": 0.05,
+    "alert_threshold_percent": 1.5,
+    "volume_spike_factor": 1.5,
+    "risk_reward_ratio": 2.0,
+    "alert_cooldown_hours": 4,
+    "run_interval_minutes": 5,
+    "option_expiry_date": "2025-08-21"
+  },
+  "symbols": {
+    "indices": [
+      "NSE:NIFTY50-INDEX",
+      "NSE:NIFTYBANK-INDEX"
+    ],
+    "stocks": [
+      "NSE:RELIANCE-EQ",
+      "NSE:HDFCBANK-EQ",
+      "NSE:ICICIBANK-EQ"
+    ]
+  }
+}

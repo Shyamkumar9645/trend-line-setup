@@ -1,0 +1,9 @@
+pandas
+mplfinance
+fyers-apiv3
+numpy
+python-dotenv
+requests
+scikit-learn
+scipy
+matplotlib

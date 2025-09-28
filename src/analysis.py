@@ -5,10 +5,14 @@ from scipy.signal import find_peaks
 import numpy as np
 from datetime import datetime, timedelta, time as dt_time
 import os
+import sys
 import time
 from dotenv import load_dotenv
 import requests
 import calendar
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from src.websocket_client import FyersWebsocketClient
 
 # --- Load Configuration from .env file ---
 load_dotenv(override=True)
@@ -79,24 +83,56 @@ def send_telegram_alert(message, image_path=None):
 def get_atm_strike(spot_price, strike_interval=50):
     return int(round(spot_price / strike_interval) * strike_interval)
 
+HOLIDAYS_2025 = [
+    datetime(2025, 1, 1).date(),
+    datetime(2025, 2, 26).date(),
+    datetime(2025, 3, 14).date(),
+    datetime(2025, 3, 31).date(),
+    datetime(2025, 4, 10).date(),
+    datetime(2025, 4, 14).date(),
+    datetime(2025, 4, 18).date(),
+    datetime(2025, 5, 1).date(),
+    datetime(2025, 8, 15).date(),
+    datetime(2025, 8, 27).date(),
+    datetime(2025, 10, 2).date(),
+    datetime(2025, 10, 21).date(),
+    datetime(2025, 10, 22).date(),
+    datetime(2025, 11, 5).date(),
+    datetime(2025, 12, 25).date(),
+]
+
 def get_next_weekly_expiry(expiry_weekday):
     today = datetime.now()
     days_ahead = expiry_weekday - today.weekday()
     if days_ahead < 0 or (days_ahead == 0 and today.hour >= 16):
         days_ahead += 7
-    return today + timedelta(days=days_ahead)
+    
+    next_expiry = today + timedelta(days=days_ahead)
+    
+    # Adjust for holidays
+    while next_expiry.date() in HOLIDAYS_2025 or next_expiry.weekday() >= 5: # 5=Saturday, 6=Sunday
+        next_expiry -= timedelta(days=1)
+        
+    return next_expiry
 
 def get_monthly_expiry(year, month):
     _, last_day = calendar.monthrange(year, month)
     last_date = datetime(year, month, last_day)
     offset = (last_date.weekday() - 3) % 7 # 3 is for Thursday
-    return last_date - timedelta(days=offset)
+    monthly_expiry = last_date - timedelta(days=offset)
+    
+    # Adjust for holidays
+    while monthly_expiry.date() in HOLIDAYS_2025 or monthly_expiry.weekday() >= 5:
+        monthly_expiry -= timedelta(days=1)
+        
+    return monthly_expiry
 
 def get_fyers_option_symbol(index_name, expiry_date, strike, option_type, expiry_type):
     expiry_yy = expiry_date.strftime('%y')
 
     if expiry_type == "WEEKLY":
-        expiry_mon = str(expiry_date.month)
+        month_code = str(expiry_date.month) if expiry_date.month < 10 else {10: 'O', 11: 'N', 12: 'D'}[expiry_date.month]
+        expiry_mon = month_code
         expiry_dd = expiry_date.strftime('%d')
     else: # MONTHLY
         expiry_mon = expiry_date.strftime('%b').upper()
@@ -108,45 +144,163 @@ def get_fyers_option_symbol(index_name, expiry_date, strike, option_type, expiry
     if not base_symbol: return None
     return f"{exchange}:{base_symbol}{expiry_yy}{expiry_mon}{expiry_dd}{strike}{option_type.upper()}"
 
-def find_final_trendline(points, prominences, full_df, x_axis, is_support):
-    if len(points) < 2 or prominences is None or len(prominences) < 2: return None
-    top_indices = np.argsort(prominences)[-10:]
-    significant_points = points.iloc[top_indices]
-    if len(significant_points) < 2: return None
+def calculate_atr(df, period=14):
+    """Calculates the Average True Range (ATR) for a given DataFrame."""
+    df['H-L'] = df['High'] - df['Low']
+    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
+    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
+    df['TR'] = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+    df['ATR'] = df['TR'].rolling(window=period).mean()
+    return df
 
-    best_line, best_score = None, -1e10
-    for i in range(len(significant_points)):
-        for j in range(i + 1, len(significant_points)):
-            p1, p2 = significant_points.iloc[i], significant_points.iloc[j]
-            p1_x = x_axis[full_df.index.get_loc(p1.name)]
-            p2_x = x_axis[full_df.index.get_loc(p2.name)]
 
-            if p1_x == p2_x: continue
+# --- Trendline Detection Parameters ---
+MIN_TOUCHES = int(os.getenv("MIN_TOUCHES", "3"))
+MAX_DEVIATION_PERCENT = float(os.getenv("MAX_DEVIATION_PERCENT", "0.01")) # 1% deviation allowed for touches
+MAX_CROSSINGS = int(os.getenv("MAX_CROSSINGS", "2")) # Max allowed close price crosses
+PROMINENCE_PERCENTILE = int(os.getenv("PROMINENCE_PERCENTILE", "75")) # Only consider peaks above this prominence percentile
+ATR_MULTIPLIER = float(os.getenv("ATR_MULTIPLIER", "1.0")) # Multiplier for ATR to calculate price tolerance
 
-            y_values = [p1['Low'] if is_support else p1['High'], p2['Low'] if is_support else p2['High']]
-            coeffs = np.polyfit([p1_x, p2_x], y_values, 1)
-            line = np.poly1d(coeffs)
+print(f"✅ Trendline MIN_TOUCHES: {MIN_TOUCHES}")
+print(f"✅ Trendline MAX_DEVIATION_PERCENT: {MAX_DEVIATION_PERCENT}")
+print(f"✅ Trendline MAX_CROSSINGS: {MAX_CROSSINGS}")
+print(f"✅ Trendline PROMINENCE_PERCENTILE: {PROMINENCE_PERCENTILE}")
+print(f"✅ Trendline ATR_MULTIPLIER: {ATR_MULTIPLIER}")
 
-            crossings, touches = 0, 0
-            for k in range(len(full_df)):
-                price_at_k = line(x_axis[k])
-                if (is_support and full_df['Close'].iloc[k] < price_at_k) or \
-                        (not is_support and full_df['Close'].iloc[k] > price_at_k):
-                    crossings += 1
+def _get_line_equation(p1_x, p1_y, p2_x, p2_y):
+    """Calculates the slope and y-intercept of a line given two points."""
+    if p1_x == p2_x: # Vertical line, should ideally not happen with time-series data
+        return None, None
+    slope = (p2_y - p1_y) / (p2_x - p1_x)
+    intercept = p1_y - slope * p1_x
+    return slope, intercept
 
-            for k in range(len(significant_points)):
-                point_k = significant_points.iloc[k]
-                point_k_x = x_axis[full_df.index.get_loc(point_k.name)]
-                point_k_y = float(point_k['Low'] if is_support else point_k['High'])
-                tolerance = 0.5 if point_k_y < 50 else 0.015 * point_k_y
-                if abs(line(point_k_x) - point_k_y) < tolerance:
-                    touches += 1
+def _get_y_on_line(slope, intercept, x):
+    """Calculates the y-value on a line for a given x."""
+    if slope is None or intercept is None: return None
+    return slope * x + intercept
 
-            score = touches * 10 - crossings * 1
-            if score > best_score:
-                best_score, best_line = score, line
+def find_trendlines(df, is_support=True, atr_multiplier=1.0):
+    price_data = df['Low'].values if is_support else df['High'].values
+    # Invert for resistance to find peaks in 'High' values
+    if not is_support:
+        price_data = df['High'].values
 
-    return best_line
+    # Find peaks (swing points)
+    # For support, we look for valleys, so we invert the price data
+    # For resistance, we look for peaks in the high values
+    peaks_indices, properties = find_peaks(price_data if not is_support else -price_data, prominence=1)
+
+    if len(peaks_indices) < MIN_TOUCHES:
+        return None, None
+
+    # Filter peaks by prominence percentile
+    prominences = properties['prominences']
+    if len(prominences) > 0:
+        prominence_threshold = np.percentile(prominences, PROMINENCE_PERCENTILE)
+        significant_peaks_indices = [idx for idx, prom in zip(peaks_indices, prominences) if prom >= prominence_threshold]
+    else:
+        significant_peaks_indices = peaks_indices
+
+    if len(significant_peaks_indices) < MIN_TOUCHES:
+        return None, None
+
+    significant_points_df = df.iloc[significant_peaks_indices]
+    x_axis = np.arange(len(df.index))
+
+    best_line_coeffs = None
+    best_score = -1
+    best_line_points = None
+    best_touches = -1
+    best_r_squared = -1
+
+    # Iterate through all combinations of MIN_TOUCHES points
+    from itertools import combinations
+    for combo_indices in combinations(range(len(significant_points_df)), MIN_TOUCHES):
+        combo_points = significant_points_df.iloc[list(combo_indices)]
+
+        # Try all pairs within the combination to form a base line
+        for i in range(len(combo_points)):
+            for j in range(i + 1, len(combo_points)):
+                p1 = combo_points.iloc[i]
+                p2 = combo_points.iloc[j]
+
+                p1_x = x_axis[df.index.get_loc(p1.name)]
+                p2_x = x_axis[df.index.get_loc(p2.name)]
+
+                if p1_x == p2_x: continue
+
+                p1_y = p1['Low'] if is_support else p1['High']
+                p2_y = p2['Low'] if is_support else p2['High']
+
+                slope, intercept = _get_line_equation(p1_x, p1_y, p2_x, p2_y)
+                if slope is None: continue
+
+                current_line_coeffs = np.polyfit([p1_x, p2_x], [p1_y, p2_y], 1)
+                current_line = np.poly1d(current_line_coeffs)
+
+                # Validate and score this line
+                touches = 0
+                crossings = 0
+                line_start_x = min(p1_x, p2_x)
+                line_end_x = max(p1_x, p2_x)
+
+                # Check for touches among all significant points
+                touched_points_x = []
+                touched_points_y = []
+                for _, sp in significant_points_df.iterrows():
+                    sp_x = x_axis[df.index.get_loc(sp.name)]
+                    sp_y = sp['Low'] if is_support else sp['High']
+                    line_y_at_sp_x = current_line(sp_x)
+                    
+                    # Define tolerance dynamically based on ATR
+                    tolerance = df['ATR'].mean() * atr_multiplier
+                    
+                    if abs(line_y_at_sp_x - sp_y) <= tolerance:
+                        touches += 1
+                        touched_points_x.append(sp_x)
+                        touched_points_y.append(sp_y)
+
+                # Check for crossings over the entire DataFrame
+                for k in range(len(df)):
+                    current_price_close = df['Close'].iloc[k]
+                    line_price_at_k = current_line(x_axis[k])
+
+                    if is_support:
+                        # For support, price closing below the line is a crossing
+                        if current_price_close < line_price_at_k:
+                            crossings += 1
+                    else:
+                        # For resistance, price closing above the line is a crossing
+                        if current_price_close > line_price_at_k:
+                            crossings += 1
+                
+                # Score calculation
+                if touches >= MIN_TOUCHES and crossings <= MAX_CROSSINGS:
+                    # R-squared calculation for the touched points
+                    if len(touched_points_x) > 1:
+                        y_predicted = current_line(np.array(touched_points_x))
+                        y_actual = np.array(touched_points_y)
+                        correlation_matrix = np.corrcoef(y_predicted, y_actual)
+                        correlation_xy = correlation_matrix[0,1]
+                        r_squared = correlation_xy**2
+                    else:
+                        r_squared = 0
+
+                    if touches > best_touches:
+                        best_touches = touches
+                        best_r_squared = r_squared
+                        best_line_coeffs = current_line_coeffs
+                        best_line_points = combo_points
+                    elif touches == best_touches:
+                        if r_squared > best_r_squared:
+                            best_r_squared = r_squared
+                            best_line_coeffs = current_line_coeffs
+                            best_line_points = combo_points
+    if best_line_coeffs is not None:
+        return np.poly1d(best_line_coeffs), best_line_points
+    return None, None
+
 
 # --- Main Logic ---
 symbols_to_analyze = []
@@ -154,6 +308,8 @@ symbols_to_analyze = []
 print("--- Step 1: Finding ATM Options for Indexes ---")
 for ticker in tickers:
     if ticker.endswith("-INDEX"):
+        symbols_to_analyze.append({'symbol': ticker, 'expiry': None})
+        print(f"Queued index for analysis: {ticker}")
         index_name_parts = ticker.split(':')
         index_name = index_name_parts[1].replace('-INDEX', '') if len(index_name_parts) > 1 else ''
 
@@ -176,44 +332,60 @@ for ticker in tickers:
             atm_strike = get_atm_strike(last_price, strike_interval)
             print(f"ATM Strike: {atm_strike}")
 
-            # --- Get both weekly and monthly expiries ---
-
-            # 1. Get current week's weekly expiry
+            # --- Get Expiry Information based on Index ---
             # Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4
-            expiry_day_of_week = 3 # Thursday default for Nifty
+
             if index_for_options == "NIFTY BANK":
-                expiry_day_of_week = 2 # CORRECTED: Wednesday for Banknifty
-            elif index_for_options == "SENSEX":
-                expiry_day_of_week = 1 # CORRECTED: Tuesday for Sensex
-
-            weekly_expiry_date = get_next_weekly_expiry(expiry_day_of_week)
-            print(f"Found Weekly Expiry: {weekly_expiry_date.strftime('%Y-%m-%d')}")
-            weekly_call = get_fyers_option_symbol(index_for_options, weekly_expiry_date, atm_strike, 'CE', 'WEEKLY')
-            weekly_put = get_fyers_option_symbol(index_for_options, weekly_expiry_date, atm_strike, 'PE', 'WEEKLY')
-            if weekly_call: symbols_to_analyze.append({'symbol': weekly_call, 'expiry': weekly_expiry_date})
-            if weekly_put: symbols_to_analyze.append({'symbol': weekly_put, 'expiry': weekly_expiry_date})
-
-            # 2. Get current month's monthly expiry
-            monthly_expiry_date = get_monthly_expiry(datetime.now().year, datetime.now().month)
-
-            # 3. Add monthly options ONLY if they are different from the weekly expiry
-            if weekly_expiry_date.date() != monthly_expiry_date.date():
-                print(f"Found Monthly Expiry: {monthly_expiry_date.strftime('%Y-%m-%d')}")
+                # Nifty Bank: Monthly expiry on the last Thursday of the month
+                monthly_expiry_date = get_monthly_expiry(datetime.now().year, datetime.now().month)
+                print(f"Found Monthly Expiry for NIFTY BANK: {monthly_expiry_date.strftime('%Y-%m-%d')}")
                 monthly_call = get_fyers_option_symbol(index_for_options, monthly_expiry_date, atm_strike, 'CE', 'MONTHLY')
                 monthly_put = get_fyers_option_symbol(index_for_options, monthly_expiry_date, atm_strike, 'PE', 'MONTHLY')
                 if monthly_call: symbols_to_analyze.append({'symbol': monthly_call, 'expiry': monthly_expiry_date})
                 if monthly_put: symbols_to_analyze.append({'symbol': monthly_put, 'expiry': monthly_expiry_date})
             else:
-                print("This week's expiry is also the monthly expiry. Skipping duplicate.")
+                # Nifty & Sensex: Weekly and Monthly expiries
+                if index_for_options == "NIFTY 50":
+                    expiry_day_of_week = 1 # Tuesday for Nifty
+                elif index_for_options == "SENSEX":
+                    expiry_day_of_week = 3 # Thursday for Sensex
+                else: # Default to Thursday
+                    expiry_day_of_week = 3
+
+                # 1. Get current week's weekly expiry
+                weekly_expiry_date = get_next_weekly_expiry(expiry_day_of_week)
+                print(f"Found Weekly Expiry: {weekly_expiry_date.strftime('%Y-%m-%d')}")
+                weekly_call = get_fyers_option_symbol(index_for_options, weekly_expiry_date, atm_strike, 'CE', 'WEEKLY')
+                weekly_put = get_fyers_option_symbol(index_for_options, weekly_expiry_date, atm_strike, 'PE', 'WEEKLY')
+                if weekly_call: symbols_to_analyze.append({'symbol': weekly_call, 'expiry': weekly_expiry_date})
+                if weekly_put: symbols_to_analyze.append({'symbol': weekly_put, 'expiry': weekly_expiry_date})
+
+                # 2. Get current month's monthly expiry
+                monthly_expiry_date = get_monthly_expiry(datetime.now().year, datetime.now().month)
+
+                # 3. Add monthly options ONLY if they are different from the weekly expiry
+                if weekly_expiry_date.date() != monthly_expiry_date.date():
+                    print(f"Found Monthly Expiry: {monthly_expiry_date.strftime('%Y-%m-%d')}")
+                    monthly_call = get_fyers_option_symbol(index_for_options, monthly_expiry_date, atm_strike, 'CE', 'MONTHLY')
+                    monthly_put = get_fyers_option_symbol(index_for_options, monthly_expiry_date, atm_strike, 'PE', 'MONTHLY')
+                    if monthly_call: symbols_to_analyze.append({'symbol': monthly_call, 'expiry': monthly_expiry_date})
+                    if monthly_put: symbols_to_analyze.append({'symbol': monthly_put, 'expiry': monthly_expiry_date})
+                else:
+                    print("This week's expiry is also the monthly expiry. Skipping duplicate.")
 
         else:
             print(f"Could not fetch live price for {ticker}. Error: {quote_response.get('message', 'Unknown error')}")
     elif ticker.endswith("-EQ"):
         symbols_to_analyze.append({'symbol': ticker, 'expiry': None})
         print(f"Queued stock for analysis: {ticker}")
+    elif ticker.endswith("-EQ"):
+        symbols_to_analyze.append({'symbol': ticker, 'expiry': None})
+        print(f"Queued stock for analysis: {ticker}")
 
 print(f"\n--- Step 2: Analyzing {len(symbols_to_analyze)} Symbols ---")
 if not os.path.exists('charts'): os.makedirs('charts')
+
+trendlines = {}
 
 for item in symbols_to_analyze:
     symbol = item['symbol']
@@ -222,16 +394,6 @@ for item in symbols_to_analyze:
     print(f"\nProcessing {symbol}...")
 
     days_to_check = DAYS_BACK
-    if expiry_date:
-        today = datetime.now()
-        expiry_date = expiry_date.replace(tzinfo=today.tzinfo)
-        days_until_expiry = (expiry_date - today).days
-
-        if days_until_expiry >= 5:
-            days_to_check = 3
-            print(f"Expiry is {days_until_expiry} days away. Using safe lookback of {days_to_check} days.")
-        else:
-            print(f"Expiry is soon ({days_until_expiry} days). Using full lookback of {days_to_check} days.")
 
     range_to_dt = datetime.combine(datetime.now().date(), dt_time.max)
     range_from_dt = datetime.combine(range_to_dt.date() - timedelta(days=days_to_check), dt_time.min)
@@ -256,38 +418,64 @@ for item in symbols_to_analyze:
 
     df = df[~df.index.duplicated(keep='first')]
 
+    df = calculate_atr(df)
+
     if df.empty:
         print(f"DataFrame is empty for {symbol} after processing. Skipping.")
         continue
 
-    prominence_value = 1 if 'CE' in symbol or 'PE' in symbol else 10
-    high_peaks_indices, high_prominences = find_peaks(np.squeeze(df['High'].values), prominence=prominence_value)
-    low_peaks_indices, low_prominences = find_peaks(np.squeeze(-df['Low'].values), prominence=prominence_value)
+    # Apply CHART_CANDLES limit if set for analysis
+    chart_candles_str = os.getenv("CHART_CANDLES")
+    if chart_candles_str and chart_candles_str.isdigit():
+        chart_candles = int(chart_candles_str)
+        if chart_candles > 0 and chart_candles < len(df):
+            df_analysis = df.tail(chart_candles).copy()
+            print(f"Analyzing the last {chart_candles} candles.")
+        else:
+            df_analysis = df.copy()
+    else:
+        df_analysis = df.copy()
 
-    support_points = df.iloc[low_peaks_indices]
-    resistance_points = df.iloc[high_peaks_indices]
+    x_axis = np.arange(len(df_analysis.index))
 
-    x_axis = np.arange(len(df.index))
-    best_support_line = find_final_trendline(support_points, low_prominences.get('prominences'), df, x_axis, is_support=True)
-    best_resistance_line = find_final_trendline(resistance_points, high_prominences.get('prominences'), df, x_axis, is_support=False)
+    best_support_line, _ = find_trendlines(df_analysis, is_support=True, atr_multiplier=ATR_MULTIPLIER)
+    best_resistance_line, _ = find_trendlines(df_analysis, is_support=False, atr_multiplier=ATR_MULTIPLIER)
 
     chart_filename = None
     if best_support_line or best_resistance_line:
         clean_symbol_name = symbol.replace(":", "_").replace("-", "_")
         chart_filename = f'charts/{clean_symbol_name}_chart.png'
-        aps = []
-        if best_support_line: aps.append(mpf.make_addplot(best_support_line(x_axis), color='g', linestyle='--'))
-        if best_resistance_line: aps.append(mpf.make_addplot(best_resistance_line(x_axis), color='r', linestyle='--'))
+        
+        df_chart = df_analysis.copy()
 
-        price_min, price_max = df['Low'].min(), df['High'].max()
+        # Recalculate x_axis for the potentially smaller df_chart
+        x_axis_chart = np.arange(len(df_chart.index))
+
+        aps = []
+        if best_support_line:
+            # The trendline is already calculated on the df_chart, so no need to adjust
+            aps.append(mpf.make_addplot(best_support_line(x_axis_chart), color='g', linestyle='--'))
+
+        if best_resistance_line:
+            # The trendline is already calculated on the df_chart, so no need to adjust
+            aps.append(mpf.make_addplot(best_resistance_line(x_axis_chart), color='r', linestyle='--'))
+
+        price_min, price_max = df_chart['Low'].min(), df_chart['High'].max()
         y_buffer = (price_max - price_min) * 0.1
         ylim = (price_min - y_buffer, price_max + y_buffer)
 
-        mpf.plot(df, type='candle', style='yahoo', title=f'{symbol} {INTERVAL}-Min Chart', ylabel='Price (INR)',
+        mpf.plot(df_chart, type='candle', style='yahoo', title=f'{symbol} {INTERVAL}-Min Chart', ylabel='Price (INR)',
                  addplot=aps, savefig=chart_filename, ylim=ylim, figsize=(12, 8), tight_layout=True)
         print(f"Chart saved to {chart_filename}")
     else:
         print(f"No valid trendlines found for {symbol}, skipping chart generation.")
+
+    if best_support_line or best_resistance_line:
+        trendlines[symbol] = {
+            'support': best_support_line,
+            'resistance': best_resistance_line,
+            'df_length': len(df_analysis)
+        }
 
     if TELEGRAM_ENABLED and (best_support_line or best_resistance_line):
         print("Checking for price alerts...")
@@ -324,3 +512,23 @@ for item in symbols_to_analyze:
     time.sleep(1)
 
 print("\nAnalysis complete. ✨")
+
+if trendlines:
+    print("\n--- Starting Live Monitoring ---")
+    websocket_client = FyersWebsocketClient(symbols=list(trendlines.keys()), trendlines=trendlines)
+    websocket_client.start()
+
+# --- Start WebSocket Client for Live Monitoring ---
+
+trendlines = {}
+for item in symbols_to_analyze:
+    symbol = item['symbol']
+    if symbol in df_analysis.columns:
+        trendlines[symbol] = {
+            'support': best_support_line,
+            'resistance': best_resistance_line
+        }
+
+if trendlines:
+    websocket_client = FyersWebsocketClient(symbols=list(trendlines.keys()), trendlines=trendlines)
+    websocket_client.start()
